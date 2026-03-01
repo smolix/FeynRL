@@ -268,7 +268,7 @@ def collect_rollouts(dataloader,
     # Total Prompts = 2 * 24 = 48 prompts (rounded up to batch boundary)
     # Total completions in replay buffer = 48 prompts * 3 n_samples = 144
 
-    batch_size = dataloader.batch_sampler.local_batch_size
+    batch_size = getattr(dataloader, 'batch_size', None) or dataloader.batch_sampler.local_batch_size
     num_batches_per_epoch = len(dataloader)
     total_prompts = num_batches_per_epoch * batch_size
     prompts_per_engine = batch_size // num_rollout_engines
@@ -586,6 +586,57 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
                          description=f"refresh rollout engines from disk (v{version})",
                          logger=logger)
 
+def create_val_dataloader(params, tokenizer, num_rollout_engines):
+    '''
+       This dataloader is used for validation rollout generation.
+       Mirrors main_eval.py implementation.
+    '''
+    val_path = params.data.val_files_path
+    if not val_path:
+        return None
+    if isinstance(val_path, list):
+        if len(val_path) == 0:
+            return None
+        val_path = val_path[0]
+
+    prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
+                            max_seq_len=params.data.max_seq_len,
+                            tokenizer=tokenizer,
+                            data_path=val_path,
+                            solution_key=params.data.solution_key,
+                            )
+
+    # since we split the data across the rollout engines
+    bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
+    dataloader = DataLoader(dataset=prompt_ds,
+                            batch_size=bsz,
+                            num_workers=params.data.num_workers,
+                            shuffle=False,
+                            pin_memory=True,
+                            drop_last=False,
+                            collate_fn=prompt_ds.collate_fn,
+                            )
+    return dataloader
+
+def run_validation(dataloader, rollout_engines, epoch, policy_version, n_samples, logger, rollout_timeout):
+    '''
+       Validation run using the provided dataloader.
+    '''
+    # Create a temporary replay buffer for val metrics.
+    # We don't want to add these to the main replay buffer used for training.
+    val_replay_buffer = ReplayBuffer(pad_token_id=dataloader.dataset.tokenizer.pad_token_id,
+                                     max_seq_len=dataloader.dataset.max_seq_len)
+
+    val_stats = collect_rollouts(dataloader=dataloader,
+                                 rollout_engines=rollout_engines,
+                                 epoch=epoch,
+                                 policy_version=policy_version,
+                                 replay_buffer=val_replay_buffer,
+                                 n_samples=n_samples,
+                                 logger=logger,
+                                 rollout_timeout=rollout_timeout)
+    return val_stats
+
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
@@ -703,6 +754,13 @@ if __name__ == "__main__":
                                                   tokenizer=tokenizer,
                                                   num_rollout_engines=num_rollout_engines,
                                                   samples_per_epoch=config.rollout.rollout_samples_per_epoch)
+
+    val_dataloader = None
+    if config.data.val_files_path:
+        logger.info(f"Loading validation dataloader from {config.data.val_files_path}")
+        val_dataloader = create_val_dataloader(params=config,
+                                               tokenizer=tokenizer,
+                                               num_rollout_engines=num_rollout_engines)
 
     logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
                 f"n_samples={config.rollout.n_samples} per prompt")
@@ -1028,6 +1086,27 @@ if __name__ == "__main__":
                                                             rollout_engines=rollout_engines,
                                                             epoch=epoch + 1,
                                                             policy_version=rollout_policy_version)
+
+        ################
+        # 10. Run validation
+        ################
+        if val_dataloader is not None:
+            logger.info(f"[Epoch {epoch+1}] Running validation...")
+            # Use current rollout_policy_version as that's what's loaded in the engines
+            val_stats = run_validation(dataloader=val_dataloader,
+                                       rollout_engines=rollout_engines,
+                                       epoch=epoch,
+                                       policy_version=rollout_policy_version,
+                                       n_samples=config.rollout.n_samples,
+                                       logger=logger,
+                                       rollout_timeout=rollout_timeout)
+
+            logger.info(f"[Epoch {epoch+1}] Validation complete: avg_reward={val_stats['avg_reward']:.4f}, "
+                        f"avg_response_len={val_stats['avg_response_len']:.1f}, "
+                        f"time={val_stats['rollout_time']:.2f}s")
+
+            if tracker:
+                tracker.log_metrics({f"val/{k}": v for k, v in val_stats.items()}, step=global_step)
 
         logger.info(f"[Epoch {epoch+1}] Complete! Total epoch time: {epoch_time:.2f}s")
         logger.info("=" * 50)
