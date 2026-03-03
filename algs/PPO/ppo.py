@@ -4,6 +4,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import Any
 import ray
+import random
 
 # Since the following functions are the same for all algorithms
 # we load them from common.py:
@@ -215,6 +216,12 @@ class PPO(COMMON):
         # convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
+
+        # normalize advs to have mean=0 and var=1
+        if mask_bool.any():
+            valid_adv = adv[mask_bool]
+            adv = (adv - valid_adv.mean()) / (valid_adv.std() + 1e-8)
+
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
@@ -405,6 +412,11 @@ class PPO(COMMON):
         ga_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
         ga_steps = int(ga_attr() if callable(ga_attr) else ga_attr)
 
+        # If num_micro is not divisible by ga_steps, the last GA bucket has fewer
+        # micro-batches. DeepSpeed still divides by ga_steps, so we must scale
+        # those losses up by ga_steps/remainder to get the correct mean gradient.
+        ga_remainder = num_micro % ga_steps
+
         # track metrics across all micro-batches
         all_metrics_policy = []
         all_metrics_value = []
@@ -465,6 +477,10 @@ class PPO(COMMON):
             if self.update_only_after_full_replay:
                 pi_loss = pi_loss * (ga_steps / num_micro)
 
+            else:
+                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                    pi_loss = pi_loss * (ga_steps / ga_remainder)
+
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
@@ -494,6 +510,10 @@ class PPO(COMMON):
             # Same loss scaling for value function
             if self.update_only_after_full_replay:
                 v_loss = v_loss * (ga_steps / num_micro)
+
+            else:
+                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                    v_loss = v_loss * (ga_steps / ga_remainder)
 
             self.value_engine.set_gradient_accumulation_boundary(is_boundary)
 

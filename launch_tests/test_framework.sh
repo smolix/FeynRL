@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Configuration
-TEST_CONFIG_DIR="./unit_tests/configs"
-LOG_DIR="./logs/unit_tests/results"
+TEST_CONFIG_DIR="./launch_tests/configs"
+LOG_DIR="./logs/launch_tests/results"
 mkdir -p "$LOG_DIR"
 
 # Algorithms to test
 ALGS=("sgrpo" "cispo" "ppo" "dpo" "sft")
 
 # Refresh configs from abstract bases
-python unit_tests/utils/generate_test_configs.py
-sudo python unit_tests/utils/create_dummy_data.py
+python launch_tests/utils/generate_test_configs.py
+sudo python launch_tests/utils/create_dummy_data.py
 
 # Collect results for summary
 declare -a SUMMARY_TABLE
@@ -104,10 +104,10 @@ echo ""
 
 # Cleanup artifacts to restore workspace status
 echo "Cleaning up generated artifacts (configs, data, checkpoints)..."
-sudo rm -rf ./unit_tests/results/
-sudo rm -rf ./unit_tests/data
+sudo rm -rf ./launch_tests/results/
+sudo rm -rf ./launch_tests/data
 # Remove only the generated top-level configs, preserving the base/ directory
-sudo rm -f ./unit_tests/configs/*.yaml
+sudo rm -f ./launch_tests/configs/*.yaml
 # Also cleanup any leftover wandb/mlrun metadata if present in root
 sudo rm -rf ./wandb/
 sudo rm -rf ./mlruns/
