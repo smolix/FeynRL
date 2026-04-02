@@ -229,7 +229,10 @@ class ReplayBuffer(Dataset):
         weights = weights / weights.sum()
 
         indices = torch.multinomial(weights, len(self.items), replacement=True)
-        self.items = [self.items[i] for i in indices.tolist()]
+        # Deep-copy tensors to prevent shared references from replacement sampling
+        def _copy_item(item):
+            return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in item.items()}
+        self.items = [_copy_item(self.items[i]) for i in indices.tolist()]
 
         # Recount action tokens
         self.total_action_tokens = sum(int((x["masks"] > 0.5).sum().item()) for x in self.items)

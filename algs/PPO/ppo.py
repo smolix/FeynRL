@@ -33,6 +33,13 @@ class PPO(COMMON):
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
+                 kl_mode: str = 'k3',
+                 kl_control: str = 'fixed',
+                 kl_target: float = 0.1,
+                 kl_horizon: int = 10000,
+                 loss_denom_mode: str = 'token_count',
+                 distill_weight: float = 0.0,
+                 teacher_model_path: str = None,
                  # ppo specific
                  value_model_path: str = None,
                  tau: float = None,
@@ -67,6 +74,22 @@ class PPO(COMMON):
         self.clip_low = float(clip_low)
         self.clip_high = float(clip_high)
         self.ent_coeff = float(entropy_coeff)
+
+        # KL mode and adaptive controller
+        self._kl_mode = str(kl_mode) if kl_mode else 'k3'
+        self._kl_control = str(kl_control) if kl_control else 'fixed'
+        self.loss_denom_mode = str(loss_denom_mode) if loss_denom_mode else 'token_count'
+        self.distill_weight = float(distill_weight) if distill_weight else 0.0
+        self.teacher_model_path = teacher_model_path
+        if self._kl_control == 'adaptive' and self.kl_coeff > 0:
+            from algs.RL.common import AdaptiveKLController
+            self._kl_controller = AdaptiveKLController(
+                init_kl_coef=self.kl_coeff,
+                target_kl=float(kl_target) if kl_target else 0.1,
+                horizon=int(kl_horizon) if kl_horizon else 10000
+            )
+        else:
+            self._kl_controller = None
 
         # value model params
         self.value_model_path = value_model_path
@@ -572,6 +595,21 @@ class PPO(COMMON):
                                                                                entropies=pi_entropies,
                                                                                ref_logprobs=ref_logprobs)
 
+            # VAPO: add NLL auxiliary loss on positive-reward samples (before scaling)
+            if self.vapo_enabled and self.vapo_nll_weight > 0.0:
+                rewards_sum = micro_batch['rewards'][:, :-1].to(device).sum(dim=1)  # [B]
+                positive_mask = (rewards_sum > 0).unsqueeze(1).float()  # [B, 1]
+                nll_mask = mask * positive_mask  # only positive-reward tokens
+                nll_token_count = nll_mask.sum().clamp(min=1.0)
+                nll_loss_sum = -(pi_logprobs * nll_mask).sum()
+                loss_total_sum = loss_total_sum + self.vapo_nll_weight * nll_loss_sum
+
+            # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
+            if self.loss_denom_mode == 'constant':
+                B_size = micro_batch['input_ids'].shape[0]
+                T_size = micro_batch['input_ids'].shape[1]
+                local_denom = torch.tensor(float(B_size * T_size), device=device)
+
             # store metrics
             all_metrics_policy.append(pi_metrics)
 
@@ -590,16 +628,6 @@ class PPO(COMMON):
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         pi_loss = pi_loss * (ga_steps / ga_remainder)
 
-            # VAPO: add NLL auxiliary loss on positive-reward samples
-            if self.vapo_enabled and self.vapo_nll_weight > 0.0:
-                # Compute NLL (cross-entropy) on samples with positive total reward
-                rewards_sum = micro_batch['rewards'][:, :-1].to(device).sum(dim=1)  # [B]
-                positive_mask = (rewards_sum > 0).unsqueeze(1).float()  # [B, 1]
-                nll_mask = mask * positive_mask  # only positive-reward tokens
-                nll_token_count = nll_mask.sum().clamp(min=1.0)
-                nll_loss = -(pi_logprobs * nll_mask).sum() / nll_token_count
-                pi_loss = pi_loss + self.vapo_nll_weight * nll_loss
-
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
@@ -614,6 +642,12 @@ class PPO(COMMON):
 
             # Compute value loss
             v_loss_sum, v_denom, v_metrics = self.compute_value_loss(values=values, returns=returns, mask=mask)
+
+            # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
+            if self.loss_denom_mode == 'constant':
+                B_size = micro_batch['input_ids'].shape[0]
+                T_size = micro_batch['input_ids'].shape[1]
+                v_denom = torch.tensor(float(B_size * T_size), device=device)
 
             # store metrics
             all_metrics_value.append(v_metrics)
@@ -642,6 +676,11 @@ class PPO(COMMON):
             # backward pass
             self.value_engine.backward(v_loss)
             self.value_engine.step()
+
+        # Update adaptive KL controller if enabled
+        if self._kl_controller is not None and all_metrics_policy:
+            avg_kl = np.mean([m.get('approx_kl', 0.0) for m in all_metrics_policy])
+            self.kl_coeff = self._kl_controller.update(avg_kl)
 
         # aggregate metrics across all micro-batches into a single dict
         aggregated_metrics = {}

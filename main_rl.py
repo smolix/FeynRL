@@ -51,9 +51,16 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
                # training related arguments
                'kl_coeff':params.train.kl_coeff,
+               'kl_mode':params.train.kl_mode or 'k3',
+               'kl_control':params.train.kl_control or 'fixed',
+               'kl_target':params.train.kl_target or 0.1,
+               'kl_horizon':params.train.kl_horizon or 10000,
                'clip_low':params.train.clip_low,
                'clip_high':params.train.clip_high,
                'entropy_coeff':params.train.entropy_coeff,
+               'loss_denom_mode':params.train.loss_denom_mode or 'token_count',
+               'distill_weight':getattr(params.train, 'distill_weight', 0.0) or 0.0,
+               'teacher_model_path':params.model.teacher_model,
                'micro_batch_size_per_gpu':params.train.train_batch_size_per_gpu,
                'update_after_full_replay':params.train.update_after_full_replay,
                'normalize_loss':params.train.normalize_loss,
@@ -69,13 +76,21 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                'peft_config':params.peft,
     }
 
-    # ppo arguments
+    # algorithm-specific arguments
     alg_name = params.train.alg_name.lower()
     if alg_name == 'ppo':
         kwargs['value_model_path'] = params.model.value_model or params.model.name
         kwargs['tau'] = params.train.tau
         kwargs['gamma'] = params.train.gamma
         kwargs['deepspeed_value_config'] = params.deepspeed_value
+        kwargs['vapo_enabled'] = params.train.vapo_enabled
+        kwargs['vapo_alpha'] = params.train.vapo_alpha
+        kwargs['vapo_nll_weight'] = params.train.vapo_nll_weight
+    if alg_name == 'sapo':
+        kwargs['sapo_tau_pos'] = params.train.sapo_tau_pos or 1.0
+        kwargs['sapo_tau_neg'] = params.train.sapo_tau_neg or 1.05
+    if alg_name == 'm2po':
+        kwargs['m2_threshold'] = params.train.m2_threshold or 0.2
     # setup ray runners
     ray_runners = []
     cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
@@ -142,6 +157,8 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
               "batch_invariant":params.rollout.batch_invariant,
+              "advantage_mode":params.train.advantage_mode or "zscore",
+              "returns_gamma":params.train.returns_gamma or 1.0,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -423,11 +440,19 @@ def apply_gdpo_normalization(replay_buffer, reward_keys, reward_weights, eps=1e-
             logger.info("[GDPO] Multi-reward fields not found in replay buffer, skipping GDPO normalization")
         return
 
-    # Group items by prompt (using a hash of input_ids)
+    # Group items by prompt. Derive prompt length from the prediction mask:
+    # masks is 0 on prompt tokens and 1 on response prediction positions.
+    # The first 1 in masks (prediction-aligned) corresponds to the logit predicting the first response token.
     groups = {}
     for idx, item in enumerate(replay_buffer.items):
-        # Use first 20 tokens as prompt key (sufficient for grouping)
-        key = tuple(item["input_ids"][:20].tolist())
+        mask = item["masks"]
+        # Find prompt length: first position where mask > 0.5 gives the start of response predictions
+        valid_pos = (mask > 0.5).nonzero(as_tuple=True)[0]
+        if valid_pos.numel() > 0:
+            prompt_end = valid_pos[0].item()
+        else:
+            prompt_end = mask.numel()
+        key = tuple(item["input_ids"][:prompt_end].tolist())
         if key not in groups:
             groups[key] = []
         groups[key].append(idx)
@@ -513,13 +538,18 @@ def collect_rollouts(dataloader,
                                              description=f"rollout generation (epoch {epoch+1})",
                                              logger=logger)
 
-        # 4. merge rollouts across all engines and collect stats
-        rollout_merged, stats = merge_rollout_with_stats(rollout_lists)
-        rollout_stats.accumulate(acc, stats)
+        # 4. merge rollouts across all engines
+        rollout_merged = []
+        for rl in rollout_lists:
+            rollout_merged.extend(rl)
 
-        # 4b. DAPO dynamic group filtering: remove groups with uniform rewards
+        # 4b. DAPO dynamic group filtering BEFORE stats (so stats reflect what's trained on)
         if filter_groups:
             rollout_merged = filter_uniform_groups(rollout_merged, n_samples, logger=logger)
+
+        # 4c. collect stats on the (possibly filtered) rollouts
+        _, stats = merge_rollout_with_stats([rollout_merged])
+        rollout_stats.accumulate(acc, stats)
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)

@@ -122,6 +122,8 @@ class Train(BaseModel):
     # PF-PPO: reward-weighted replay resampling
     pf_ppo_enabled: bool | None = None
     pf_ppo_weight_pow: float | None = None
+    # On-policy distillation weight (0.0 = disabled)
+    distill_weight: float | None = None
 
     # PPO-specific arguments
     # GAE lambda
@@ -696,6 +698,38 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # [1-clip_low, 1+clip_high] requires non-negative values
             if config.train.clip_low < 0 or config.train.clip_high < 0:
                 raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")
+
+            # Validate new algorithm config fields
+            valid_adv_modes = {"zscore", "mean_only", "rloo", "token_returns", "greedy_baseline"}
+            if config.train.advantage_mode and config.train.advantage_mode not in valid_adv_modes:
+                raise ValueError(f"advantage_mode must be one of {sorted(valid_adv_modes)}, got '{config.train.advantage_mode}'")
+
+            valid_adv_batch = {"none", "whiten", "batch_std"}
+            if config.train.advantage_batch_norm and config.train.advantage_batch_norm not in valid_adv_batch:
+                raise ValueError(f"advantage_batch_norm must be one of {sorted(valid_adv_batch)}, got '{config.train.advantage_batch_norm}'")
+
+            valid_kl_modes = {"k1", "k2", "k3", "abs", "k3_plus"}
+            if config.train.kl_mode and config.train.kl_mode not in valid_kl_modes:
+                raise ValueError(f"kl_mode must be one of {sorted(valid_kl_modes)}, got '{config.train.kl_mode}'")
+
+            valid_kl_control = {"fixed", "adaptive"}
+            if config.train.kl_control and config.train.kl_control not in valid_kl_control:
+                raise ValueError(f"kl_control must be one of {sorted(valid_kl_control)}, got '{config.train.kl_control}'")
+
+            if config.train.kl_control == "adaptive":
+                if config.train.kl_target is not None and config.train.kl_target <= 0:
+                    raise ValueError(f"kl_target must be > 0 for adaptive KL, got {config.train.kl_target}")
+
+            valid_loss_denom = {"token_count", "constant"}
+            if config.train.loss_denom_mode and config.train.loss_denom_mode not in valid_loss_denom:
+                raise ValueError(f"loss_denom_mode must be one of {sorted(valid_loss_denom)}, got '{config.train.loss_denom_mode}'")
+
+            if config.train.sapo_tau_pos is not None and config.train.sapo_tau_pos <= 0:
+                raise ValueError(f"sapo_tau_pos must be > 0, got {config.train.sapo_tau_pos}")
+            if config.train.sapo_tau_neg is not None and config.train.sapo_tau_neg <= 0:
+                raise ValueError(f"sapo_tau_neg must be > 0, got {config.train.sapo_tau_neg}")
+            if config.train.m2_threshold is not None and config.train.m2_threshold <= 0:
+                raise ValueError(f"m2_threshold must be > 0, got {config.train.m2_threshold}")
 
             if config.train.alg_name == "ppo":
                 if config.train.tau is None or config.train.gamma is None or not config.model.value_model:

@@ -30,6 +30,13 @@ class SAPO(COMMON):
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
+                 kl_mode: str = 'k3',
+                 kl_control: str = 'fixed',
+                 kl_target: float = 0.1,
+                 kl_horizon: int = 10000,
+                 loss_denom_mode: str = 'token_count',
+                 distill_weight: float = 0.0,
+                 teacher_model_path: str = None,
                  sapo_tau_pos: float = 1.0,
                  sapo_tau_neg: float = 1.05,
                  ):
@@ -55,6 +62,22 @@ class SAPO(COMMON):
         self.clip_low = float(clip_low)
         self.clip_high = float(clip_high)
         self.ent_coeff = float(entropy_coeff)
+
+        # KL mode and adaptive controller
+        self._kl_mode = str(kl_mode) if kl_mode else 'k3'
+        self._kl_control = str(kl_control) if kl_control else 'fixed'
+        self.loss_denom_mode = str(loss_denom_mode) if loss_denom_mode else 'token_count'
+        self.distill_weight = float(distill_weight) if distill_weight else 0.0
+        self.teacher_model_path = teacher_model_path
+        if self._kl_control == 'adaptive' and self.kl_coeff > 0:
+            from algs.RL.common import AdaptiveKLController
+            self._kl_controller = AdaptiveKLController(
+                init_kl_coef=self.kl_coeff,
+                target_kl=float(kl_target) if kl_target else 0.1,
+                horizon=int(kl_horizon) if kl_horizon else 10000
+            )
+        else:
+            self._kl_controller = None
 
         # SAPO-specific parameters
         self.tau_pos = float(sapo_tau_pos)
@@ -281,6 +304,12 @@ class SAPO(COMMON):
                                                                                entropies=pi_entropies,
                                                                                ref_logprobs=ref_logprobs)
 
+            # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
+            if self.loss_denom_mode == 'constant':
+                B_size = micro_batch['input_ids'].shape[0]
+                T_size = micro_batch['input_ids'].shape[1]
+                local_denom = torch.tensor(float(B_size * T_size), device=device)
+
             # store metrics
             all_metrics.append(pi_metrics)
             if engine_id == 0:
@@ -314,6 +343,11 @@ class SAPO(COMMON):
             # backward pass
             self.policy_engine.backward(pi_loss)
             self.policy_engine.step()
+
+        # Update adaptive KL controller if enabled
+        if self._kl_controller is not None and all_metrics:
+            avg_kl = np.mean([m.get('approx_kl', 0.0) for m in all_metrics])
+            self.kl_coeff = self._kl_controller.update(avg_kl)
 
         # aggregate metrics across all micro-batches
         aggregated_metrics = {}

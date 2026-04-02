@@ -39,6 +39,7 @@ class VLLMRolloutEngine:
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  advantage_mode: str = "zscore",
+                 returns_gamma: float = 1.0,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -95,6 +96,7 @@ class VLLMRolloutEngine:
         self.reward_broadcast = bool(reward_broadcast)
         # Advantage estimation mode
         self.advantage_mode = str(advantage_mode) if advantage_mode else "zscore"
+        self.returns_gamma = float(returns_gamma) if returns_gamma else 1.0
 
     def log(self, msg: str) -> None:
         '''
@@ -659,16 +661,37 @@ class VLLMRolloutEngine:
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
 
-        if self.advantage_mode == "token_returns" or self.advantage_mode == "greedy_baseline":
-            # For token_returns and greedy_baseline, keep raw rewards;
-            # advantage computation happens in training loop
+        if self.advantage_mode == "token_returns":
+            # REINFORCE++: compute token-level discounted cumulative returns
+            gamma = getattr(self, 'returns_gamma', 1.0)
+            for sample in samples:
+                token_rewards = sample['token_rewards']
+                T = token_rewards.numel()
+                returns = torch.zeros(T, dtype=torch.float)
+                running_return = 0.0
+                for t in reversed(range(T)):
+                    # Only accumulate returns within the response (prompt tokens have 0 reward)
+                    running_return = token_rewards[t].item() + gamma * running_return
+                    returns[t] = running_return
+                    # Reset at prompt boundary (token_rewards are 0 on prompt, so this
+                    # naturally works — running_return stays 0 until response starts)
+                sample["token_zscores"] = returns
+                # prediction-aligned
+                pred_zscores = torch.zeros_like(returns)
+                pred_start = prompt_len - 1
+                pred_end = T - 1
+                pred_zscores[pred_start:pred_end] = returns[prompt_len:]
+                sample["pred_zscores"] = pred_zscores
+            return
+
+        if self.advantage_mode == "greedy_baseline":
+            # For greedy_baseline, keep raw rewards; baseline subtraction happens externally
             for sample in samples:
                 zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
                 zscore[-1] = sample['token_rewards'][-1]
                 sample["token_zscores"] = zscore
                 if self.reward_broadcast:
                     sample["token_zscores"][prompt_len:] = zscore[-1]
-                # prediction-aligned zscores
                 pred_zscores = torch.zeros_like(sample['token_zscores'], dtype=torch.float)
                 pred_start = prompt_len - 1
                 pred_end = len(sample['token_zscores']) - 1
