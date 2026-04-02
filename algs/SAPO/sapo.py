@@ -11,7 +11,7 @@ import random
 from algs.RL.common import COMMON
 
 @ray.remote
-class GRPO(COMMON):
+class SAPO(COMMON):
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,
@@ -37,6 +37,8 @@ class GRPO(COMMON):
                  loss_denom_mode: str = 'token_count',
                  distill_weight: float = 0.0,
                  teacher_model_path: str = None,
+                 sapo_tau_pos: float = 1.0,
+                 sapo_tau_neg: float = 1.05,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -76,6 +78,10 @@ class GRPO(COMMON):
             )
         else:
             self._kl_controller = None
+
+        # SAPO-specific parameters
+        self.tau_pos = float(sapo_tau_pos)
+        self.tau_neg = float(sapo_tau_neg)
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -123,9 +129,10 @@ class GRPO(COMMON):
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
-            Compute policy loss:
+            Compute SAPO policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
-                2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+                2. gate(r, tau) = sigmoid(tau * (r - 1)) * (4 / tau)
+                3. loss = -(gate * adv) * mask
             Returns:
                 loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
                                 Caller is responsible for scaling before backward.
@@ -150,10 +157,10 @@ class GRPO(COMMON):
         logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
         ratio   = torch.exp(logratio)
 
-        # 3. compute loss as raw sums (caller normalizes for backward)
-        unclipped = ratio * adv
-        clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
-        pi_sum    = -(torch.minimum(unclipped, clip_adv) * mask).sum()
+        # 3. SAPO: smooth sigmoid gate instead of hard clipping
+        taus = torch.where(adv > 0, self.tau_pos, self.tau_neg)
+        gates = torch.sigmoid(taus * (ratio - 1.0)) * (4.0 / taus)
+        pi_sum = -(gates * adv * mask).sum()
 
         # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
@@ -261,7 +268,7 @@ class GRPO(COMMON):
             # all are [B, T]
             # zscore is normalized rewards using the number of samples for each proompt (X -mu) / (std + eps)
             # this is a simple baseline for policy gradients (PPO in this code) as it reflects relative quality
-            # among that prompt’s samples.
+            # among that prompt's samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
@@ -296,12 +303,6 @@ class GRPO(COMMON):
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
                                                                                ref_logprobs=ref_logprobs)
-
-            # On-policy distillation: add RKL loss if teacher model is available
-            if self.distill_weight > 0.0 and hasattr(self, 'teacher_engine') and self.teacher_engine is not None:
-                teacher_logprobs = self.teacher_forward(input_ids=input_ids, att_mask=att_mask, pos_ids=pos_ids)
-                distill_loss, _ = self.compute_distillation_loss(pi_logprobs, teacher_logprobs, mask)
-                loss_total_sum = loss_total_sum + self.distill_weight * distill_loss
 
             # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
             if self.loss_denom_mode == 'constant':

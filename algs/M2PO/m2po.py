@@ -11,7 +11,7 @@ import random
 from algs.RL.common import COMMON
 
 @ray.remote
-class GRPO(COMMON):
+class M2PO(COMMON):
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,
@@ -37,6 +37,7 @@ class GRPO(COMMON):
                  loss_denom_mode: str = 'token_count',
                  distill_weight: float = 0.0,
                  teacher_model_path: str = None,
+                 m2_threshold: float = 0.2,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -76,6 +77,9 @@ class GRPO(COMMON):
             )
         else:
             self._kl_controller = None
+
+        # M2PO-specific parameters
+        self.m2_threshold = float(m2_threshold)
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -123,9 +127,10 @@ class GRPO(COMMON):
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
-            Compute policy loss:
+            Compute M2PO policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
-                2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+                2. Compute second-moment mask to suppress high-variance tokens
+                3. Apply PPO clipping with effective_mask
             Returns:
                 loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
                                 Caller is responsible for scaling before backward.
@@ -142,7 +147,6 @@ class GRPO(COMMON):
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
         mask = mask_bool.to(dtype=dtype)
-        denom = mask.sum().clamp(min=1.0)
 
         # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
         raw_logratio = (logprobs - old_logprobs).to(torch.float32)
@@ -150,36 +154,73 @@ class GRPO(COMMON):
         logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
         ratio   = torch.exp(logratio)
 
-        # 3. compute loss as raw sums (caller normalizes for backward)
+        # 3. M2PO: compute second-moment mask to suppress high-variance tokens
+        delta = (old_logprobs - logprobs).to(torch.float32)
+        delta = torch.where(mask_bool, delta, torch.zeros_like(delta))
+        m2_values = delta * delta  # squared log-ratios
+
+        # For each sequence, sort m2 values and find threshold
+        m2_mask = torch.ones_like(mask_bool)
+        for b in range(m2_values.shape[0]):
+            valid_idx = mask_bool[b].nonzero(as_tuple=True)[0]
+            if valid_idx.numel() == 0:
+                continue
+            valid_m2 = m2_values[b, valid_idx]
+            sorted_m2, sort_idx = valid_m2.sort(descending=True)
+            # Progressively include tokens from lowest m2 to highest
+            # Find cutoff where mean m2 of remaining tokens < threshold
+            n = sorted_m2.numel()
+            suffix_sums = sorted_m2.flip(0).cumsum(0).flip(0)
+            counts = torch.arange(n, 0, -1, device=suffix_sums.device, dtype=torch.float32)
+            avg_m2 = suffix_sums / counts
+            # Find first index where avg_m2 < threshold
+            below = (avg_m2 < self.m2_threshold).nonzero(as_tuple=True)[0]
+            if below.numel() > 0:
+                num_to_mask = below[0].item()
+            else:
+                num_to_mask = n  # mask everything (shouldn't normally happen)
+            if num_to_mask > 0:
+                # Mask the top num_to_mask highest M2 tokens
+                masked_positions = valid_idx[sort_idx[:num_to_mask]]
+                m2_mask[b, masked_positions] = False
+
+        # Apply M2 mask: only train on tokens that pass the second-moment threshold
+        effective_mask = mask * m2_mask.to(dtype=dtype)
+        denom = effective_mask.sum().clamp(min=1.0)
+
+        # 4. compute loss as raw sums (caller normalizes for backward)
         unclipped = ratio * adv
         clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
-        pi_sum    = -(torch.minimum(unclipped, clip_adv) * mask).sum()
+        pi_sum    = -(torch.minimum(unclipped, clip_adv) * effective_mask).sum()
 
-        # 4. compute entropy loss (raw sum)
+        # 5. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
-            ent_sum = (entropies * mask).sum()
+            ent_sum = (entropies * effective_mask).sum()
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
             # avoid calculating kl for padded tokens.
             kl_dist = torch.where(mask_bool, kl_dist, torch.zeros_like(kl_dist))
-            kl_sum  = (kl_dist * mask).sum()
+            kl_sum  = (kl_dist * effective_mask).sum()
 
         loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum
 
-        # 5. useful metrics. Here per-token means using local denom for interpretability.
+        # 6. useful metrics. Here per-token means using local denom for interpretability.
         with torch.no_grad():
             # first term too large ==> policy changed too much upward
             # second term too small ==> policy changed too much downward
             clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
             # fraction of masked tokens that ratio out of ranges
-            clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
+            clipfrac = (clipped_mask.to(dtype=dtype) * effective_mask).sum() / denom
 
             # approx KL (var-reduced): log(pi/pi_old) + pi_old/pi - 1
             # logratio = log(pi/pi_old)
             ratio_inv = torch.exp(-logratio)
             approx_kl_t = logratio + ratio_inv - 1.0
-            approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
+            approx_kl = (approx_kl_t.to(dtype=dtype) * effective_mask).sum() / denom
+
+            # M2PO-specific metric: fraction of valid tokens masked by M2
+            m2_mask_ratio = float((~m2_mask & mask_bool).sum().item()) / max(mask_bool.sum().item(), 1)
 
             # save the metrics for debugging
             metrics = {'clipfrac': clipfrac.item(),
@@ -187,7 +228,8 @@ class GRPO(COMMON):
                        'ent_loss': (ent_sum / denom).item(),
                        'pi_loss': (pi_sum / denom).item(),
                        'loss_total': (loss_total_sum / denom).item(),
-                       'kl_ref': (kl_sum / denom).item(),}
+                       'kl_ref': (kl_sum / denom).item(),
+                       'm2_mask_ratio': m2_mask_ratio,}
 
         return loss_total_sum, denom, metrics
 
@@ -261,7 +303,7 @@ class GRPO(COMMON):
             # all are [B, T]
             # zscore is normalized rewards using the number of samples for each proompt (X -mu) / (std + eps)
             # this is a simple baseline for policy gradients (PPO in this code) as it reflects relative quality
-            # among that prompt’s samples.
+            # among that prompt's samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
@@ -296,12 +338,6 @@ class GRPO(COMMON):
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
                                                                                ref_logprobs=ref_logprobs)
-
-            # On-policy distillation: add RKL loss if teacher model is available
-            if self.distill_weight > 0.0 and hasattr(self, 'teacher_engine') and self.teacher_engine is not None:
-                teacher_logprobs = self.teacher_forward(input_ids=input_ids, att_mask=att_mask, pos_ids=pos_ids)
-                distill_loss, _ = self.compute_distillation_loss(pi_logprobs, teacher_logprobs, mask)
-                loss_total_sum = loss_total_sum + self.distill_weight * distill_loss
 
             # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
             if self.loss_denom_mode == 'constant':

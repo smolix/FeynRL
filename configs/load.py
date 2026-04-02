@@ -78,10 +78,52 @@ class Train(BaseModel):
 
     # RL-specific policy arguments
     kl_coeff: float | None = None
+    # KL penalty mode: k1, k2, k3 (default), abs, k3_plus
+    kl_mode: str | None = None
+    # KL controller: fixed (default) or adaptive
+    kl_control: str | None = None
+    # Target KL for adaptive controller
+    kl_target: float | None = None
+    # Horizon for adaptive KL controller
+    kl_horizon: int | None = None
     clip_low: float | None = None
     clip_high: float | None = None
     entropy_coeff: float | None = None
+    # Advantage estimation mode for RL algorithms
+    # zscore: (r - mean_g) / (std_g + eps)  [GRPO default]
+    # mean_only: r - mean_g  [Dr.GRPO, REINFORCE++ baseline, LitePPO]
+    # rloo: r - mean_others = G/(G-1)*(r - mean_g)  [RLOO]
+    # token_returns: cumulative discounted returns  [REINFORCE++]
+    # greedy_baseline: r - r_greedy  [ReMax]
+    advantage_mode: str | None = None
+    # Batch-level post-processing of advantages
+    # none: no batch normalization
+    # whiten: (A - mean_batch) / std_batch  [REINFORCE++, REINFORCE++ baseline]
+    # batch_std: A / std_batch  [LitePPO]
+    advantage_batch_norm: str | None = None
+    # Loss denominator mode
+    # token_count: actual valid token count (default)
+    # constant: B * max_seq_len (Dr.GRPO style)
+    loss_denom_mode: str | None = None
+    # Discount factor for token-level returns (REINFORCE++)
+    returns_gamma: float | None = None
+    # SAPO temperatures (only used when alg_name=sapo)
+    sapo_tau_pos: float | None = None
+    sapo_tau_neg: float | None = None
+    # M2PO second-moment threshold (only used when alg_name=m2po)
+    m2_threshold: float | None = None
+    # VAPO length-adaptive GAE alpha (only used with alg_name=ppo and vapo_enabled=True)
+    vapo_enabled: bool | None = None
+    vapo_alpha: float | None = None
+    vapo_nll_weight: float | None = None
     update_after_full_replay: bool | None = None
+    # Multi-iteration: number of policy updates per generation batch (mu > 1)
+    num_iterations: int | None = None
+    # PF-PPO: reward-weighted replay resampling
+    pf_ppo_enabled: bool | None = None
+    pf_ppo_weight_pow: float | None = None
+    # On-policy distillation weight (0.0 = disabled)
+    distill_weight: float | None = None
 
     # PPO-specific arguments
     # GAE lambda
@@ -155,6 +197,8 @@ class Model(BaseModel):
     model_class: str = None
     attn_implementation: str = None
     gradient_checkpointing: bool = None
+    # Teacher model for on-policy distillation
+    teacher_model: str | None = None
 
 class Peft(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -230,6 +274,9 @@ class Reward(BaseModel):
     broadcast: bool | None = None
     eps_reward_norm: float | None = None
     reward_func: str | None = None
+    # Multi-reward support (GDPO): list of reward component keys and their weights
+    reward_keys: list[str] | None = None
+    reward_weights: list[float] | None = None
 
 class Overlap(BaseModel):
     '''
@@ -270,6 +317,9 @@ class Rollout(BaseModel):
     rollout_samples_per_epoch: int | None = None
     batch_invariant: bool = False
     max_model_len: int | None = None
+    # Dynamic group filtering (DAPO): filter prompt groups where all completions
+    # have the same reward (no learning signal)
+    filter_groups: bool = False
 
 class Config(BaseModel):
     '''
@@ -648,6 +698,38 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # [1-clip_low, 1+clip_high] requires non-negative values
             if config.train.clip_low < 0 or config.train.clip_high < 0:
                 raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")
+
+            # Validate new algorithm config fields
+            valid_adv_modes = {"zscore", "mean_only", "rloo", "token_returns", "greedy_baseline"}
+            if config.train.advantage_mode and config.train.advantage_mode not in valid_adv_modes:
+                raise ValueError(f"advantage_mode must be one of {sorted(valid_adv_modes)}, got '{config.train.advantage_mode}'")
+
+            valid_adv_batch = {"none", "whiten", "batch_std"}
+            if config.train.advantage_batch_norm and config.train.advantage_batch_norm not in valid_adv_batch:
+                raise ValueError(f"advantage_batch_norm must be one of {sorted(valid_adv_batch)}, got '{config.train.advantage_batch_norm}'")
+
+            valid_kl_modes = {"k1", "k2", "k3", "abs", "k3_plus"}
+            if config.train.kl_mode and config.train.kl_mode not in valid_kl_modes:
+                raise ValueError(f"kl_mode must be one of {sorted(valid_kl_modes)}, got '{config.train.kl_mode}'")
+
+            valid_kl_control = {"fixed", "adaptive"}
+            if config.train.kl_control and config.train.kl_control not in valid_kl_control:
+                raise ValueError(f"kl_control must be one of {sorted(valid_kl_control)}, got '{config.train.kl_control}'")
+
+            if config.train.kl_control == "adaptive":
+                if config.train.kl_target is not None and config.train.kl_target <= 0:
+                    raise ValueError(f"kl_target must be > 0 for adaptive KL, got {config.train.kl_target}")
+
+            valid_loss_denom = {"token_count", "constant"}
+            if config.train.loss_denom_mode and config.train.loss_denom_mode not in valid_loss_denom:
+                raise ValueError(f"loss_denom_mode must be one of {sorted(valid_loss_denom)}, got '{config.train.loss_denom_mode}'")
+
+            if config.train.sapo_tau_pos is not None and config.train.sapo_tau_pos <= 0:
+                raise ValueError(f"sapo_tau_pos must be > 0, got {config.train.sapo_tau_pos}")
+            if config.train.sapo_tau_neg is not None and config.train.sapo_tau_neg <= 0:
+                raise ValueError(f"sapo_tau_neg must be > 0, got {config.train.sapo_tau_neg}")
+            if config.train.m2_threshold is not None and config.train.m2_threshold <= 0:
+                raise ValueError(f"m2_threshold must be > 0, got {config.train.m2_threshold}")
 
             if config.train.alg_name == "ppo":
                 if config.train.tau is None or config.train.gamma is None or not config.model.value_model:

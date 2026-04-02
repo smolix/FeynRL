@@ -212,3 +212,28 @@ class ReplayBuffer(Dataset):
         evicted = before - len(self.items)
 
         return evicted
+
+    def resample_by_reward(self, weight_pow: float = 2.0) -> int:
+        '''
+            PF-PPO: resample the replay buffer with reward-based importance weights.
+            Higher-magnitude reward samples are upweighted.
+            Returns the number of items after resampling (same as before).
+        '''
+        if len(self.items) == 0:
+            return 0
+
+        scores = torch.tensor([item["rewards"].sum().item() for item in self.items],
+                              dtype=torch.float32)
+        weights = scores.abs().pow(weight_pow)
+        weights = weights.clamp(min=1e-8)
+        weights = weights / weights.sum()
+
+        indices = torch.multinomial(weights, len(self.items), replacement=True)
+        # Deep-copy tensors to prevent shared references from replacement sampling
+        def _copy_item(item):
+            return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in item.items()}
+        self.items = [_copy_item(self.items[i]) for i in indices.tolist()]
+
+        # Recount action tokens
+        self.total_action_tokens = sum(int((x["masks"] > 0.5).sum().item()) for x in self.items)
+        return len(self.items)

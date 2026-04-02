@@ -11,7 +11,7 @@ import random
 from algs.RL.common import COMMON
 
 @ray.remote
-class GRPO(COMMON):
+class GSPO(COMMON):
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,
@@ -123,9 +123,10 @@ class GRPO(COMMON):
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
-            Compute policy loss:
-                1. ratio = exp(logprobs - old_logprobs)
-                2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+            Compute GSPO policy loss:
+                1. Compute sequence-level geometric mean importance ratio
+                2. Combine with per-token log-prob for gradient flow
+                3. Apply standard PPO clipping on the combined ratio
             Returns:
                 loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
                                 Caller is responsible for scaling before backward.
@@ -144,11 +145,18 @@ class GRPO(COMMON):
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
-        # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
+        # 2. GSPO: sequence-level geometric mean importance ratio
         raw_logratio = (logprobs - old_logprobs).to(torch.float32)
-        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
         logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
-        ratio   = torch.exp(logratio)
+        # Compute per-sequence mean of log-ratios
+        seq_lengths = mask.sum(dim=1).clamp(min=1.0)  # [B]
+        mean_logratio = (logratio * mask).sum(dim=1) / seq_lengths  # [B]
+        # Combined ratio with stop-gradient: gradients flow through per-token log_prob
+        # but the sequence-level ratio magnitude is treated as fixed
+        combined_logratio = logprobs.to(torch.float32) - logprobs.detach().to(torch.float32) + mean_logratio.detach().unsqueeze(1)
+        combined_logratio = torch.where(mask_bool, combined_logratio, torch.zeros_like(combined_logratio))
+        ratio = torch.exp(combined_logratio)
+        # Use the original per-token logratio for metrics (approx_kl, clipfrac)
 
         # 3. compute loss as raw sums (caller normalizes for backward)
         unclipped = ratio * adv
@@ -168,10 +176,12 @@ class GRPO(COMMON):
         loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum
 
         # 5. useful metrics. Here per-token means using local denom for interpretability.
+        #    Use original per-token logratio for clipfrac and approx_kl.
         with torch.no_grad():
+            ratio_per_token = torch.exp(logratio)
             # first term too large ==> policy changed too much upward
             # second term too small ==> policy changed too much downward
-            clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
+            clipped_mask = (ratio_per_token > (1.0 + self.clip_high)) | (ratio_per_token < (1.0 - self.clip_low))
             # fraction of masked tokens that ratio out of ranges
             clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
 
@@ -261,7 +271,7 @@ class GRPO(COMMON):
             # all are [B, T]
             # zscore is normalized rewards using the number of samples for each proompt (X -mu) / (std + eps)
             # this is a simple baseline for policy gradients (PPO in this code) as it reflects relative quality
-            # among that prompt’s samples.
+            # among that prompt's samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
@@ -296,12 +306,6 @@ class GRPO(COMMON):
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
                                                                                ref_logprobs=ref_logprobs)
-
-            # On-policy distillation: add RKL loss if teacher model is available
-            if self.distill_weight > 0.0 and hasattr(self, 'teacher_engine') and self.teacher_engine is not None:
-                teacher_logprobs = self.teacher_forward(input_ids=input_ids, att_mask=att_mask, pos_ids=pos_ids)
-                distill_loss, _ = self.compute_distillation_loss(pi_logprobs, teacher_logprobs, mask)
-                loss_total_sum = loss_total_sum + self.distill_weight * distill_loss
 
             # BUG-5 fix: constant denominator for Dr.GRPO-style loss normalization
             if self.loss_denom_mode == 'constant':
