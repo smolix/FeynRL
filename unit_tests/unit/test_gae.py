@@ -7,7 +7,7 @@ from algs.PPO.ppo import PPO
 def test_gae_correctness():
     # Use PPO directly since conftest.py mocks @ray.remote to be a no-op
     ppo_logic = PPO 
-    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5)
+    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5, vapo_enabled=False, vapo_alpha=0.05)
     
     # Simple deterministic test case
     rewards = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
@@ -34,7 +34,7 @@ def test_gae_correctness():
 
 def test_gae_mask_behavior():
     ppo_logic = PPO
-    dummy_self = SimpleNamespace(gamma=0.99, tau=0.95)
+    dummy_self = SimpleNamespace(gamma=0.99, tau=0.95, vapo_enabled=False, vapo_alpha=0.05)
     B, T = 1, 4
     rewards = torch.randn(B, T)
     values = torch.randn(B, T)
@@ -48,7 +48,7 @@ def test_gae_mask_behavior():
 
 def test_gae_nan_failure():
     ppo_logic = PPO
-    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5)
+    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5, vapo_enabled=False, vapo_alpha=0.05)
     rewards = torch.tensor([[1.0, float('nan')]])
     values = torch.tensor([[0.5, 0.5]])
     done = torch.tensor([[0.0, 1.0]])
@@ -59,7 +59,7 @@ def test_gae_nan_failure():
 
 def test_gae_mask_holes():
     ppo_logic = PPO
-    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5)
+    dummy_self = SimpleNamespace(gamma=0.9, tau=0.5, vapo_enabled=False, vapo_alpha=0.05)
     rewards = torch.tensor([[1.0, 2.0, 3.0]])
     values = torch.tensor([[0.5, 0.5, 0.5]])
     done = torch.zeros_like(rewards)

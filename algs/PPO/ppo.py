@@ -38,6 +38,10 @@ class PPO(COMMON):
                  tau: float = None,
                  gamma: float = None,
                  deepspeed_value_config: Any = None,
+                 # VAPO: length-adaptive GAE
+                 vapo_enabled: bool = None,
+                 vapo_alpha: float = None,
+                 vapo_nll_weight: float = None,
 
                  ):
         assert tau is not None and gamma is not None, 'tau and gamma must be provided for PPO'
@@ -68,6 +72,11 @@ class PPO(COMMON):
         self.value_model_path = value_model_path
         self.tau = float(tau)
         self.gamma = float(gamma)
+
+        # VAPO: length-adaptive GAE lambda
+        self.vapo_enabled = bool(vapo_enabled) if vapo_enabled is not None else False
+        self.vapo_alpha = float(vapo_alpha) if vapo_alpha is not None else 0.05
+        self.vapo_nll_weight = float(vapo_nll_weight) if vapo_nll_weight is not None else 0.0
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -193,15 +202,26 @@ class PPO(COMMON):
         mask  = mask.to(dtype=torch.float32, device=device)
         done  = done.to(dtype=torch.float32, device=device)
 
-        # 8. Compute returns and advantages
+        # 8. Compute GAE lambda (possibly length-adaptive for VAPO)
+        if self.vapo_enabled:
+            # VAPO: lambda = 1 - 1/(alpha * seq_len) per sequence
+            # Longer sequences get lambda closer to 1 (more Monte Carlo).
+            seq_lens = mask.sum(dim=1).clamp(min=1.0)  # [B]
+            per_seq_tau = (1.0 - 1.0 / (self.vapo_alpha * seq_lens))  # [B]
+            per_seq_tau = per_seq_tau.clamp(min=0.0, max=1.0)
+        else:
+            per_seq_tau = None
+
+        # 9. Compute returns and advantages
         for t in reversed(range(T)): # [T-1, 0]
             # Done is 1 if EOS/Terminal, we do NOT bootstrap from t+1.
             not_done = 1.0 - done[:, t]
             is_valid = mask[:, t]
 
             # GAE: A[t] = delta[t] + gamma * tau * A[t+1] * (1 - done[t])
+            tau_t = per_seq_tau if per_seq_tau is not None else self.tau
             delta = rewards[:, t] + (self.gamma * next_val * not_done) - values[:, t]
-            last_adv   = is_valid * (delta + (self.gamma * self.tau * last_adv * not_done))
+            last_adv   = is_valid * (delta + (self.gamma * tau_t * last_adv * not_done))
             advs[:, t] = last_adv
 
             # At valid positions use v(s_t) and at padding keep next_val
@@ -569,6 +589,16 @@ class PPO(COMMON):
                 else:
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         pi_loss = pi_loss * (ga_steps / ga_remainder)
+
+            # VAPO: add NLL auxiliary loss on positive-reward samples
+            if self.vapo_enabled and self.vapo_nll_weight > 0.0:
+                # Compute NLL (cross-entropy) on samples with positive total reward
+                rewards_sum = micro_batch['rewards'][:, :-1].to(device).sum(dim=1)  # [B]
+                positive_mask = (rewards_sum > 0).unsqueeze(1).float()  # [B, 1]
+                nll_mask = mask * positive_mask  # only positive-reward tokens
+                nll_token_count = nll_mask.sum().clamp(min=1.0)
+                nll_loss = -(pi_logprobs * nll_mask).sum() / nll_token_count
+                pi_loss = pi_loss + self.vapo_nll_weight * nll_loss
 
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 

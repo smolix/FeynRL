@@ -32,6 +32,9 @@ Algorithm_Registry = {# supported algorithms
                       'cispo': ('algs.CISPO.cispo', 'CISPO'),
                       'p3o':   ('algs.P3O.p3o', 'P3O'),
                       'ppo':   ('algs.PPO.ppo', 'PPO'),
+                      'sapo':  ('algs.SAPO.sapo', 'SAPO'),
+                      'gspo':  ('algs.GSPO.gspo', 'GSPO'),
+                      'm2po':  ('algs.M2PO.m2po', 'M2PO'),
                      }
 
 def create_training_engines(params, alg, world_size, master_addr, master_port):
@@ -316,6 +319,147 @@ def merge_rollout_with_stats(rollout_lists):
 
     return rollout_merged, stats
 
+def filter_uniform_groups(rollout_samples, n_samples, logger=None):
+    '''
+        DAPO dynamic group filtering: remove prompt groups where all completions
+        have the same reward (all correct or all incorrect), since these provide
+        no learning signal for group-relative advantage estimation.
+        Returns filtered list of samples.
+    '''
+    if n_samples <= 1:
+        return rollout_samples
+
+    # Group samples by prompt
+    groups = {}
+    for sample in rollout_samples:
+        key = tuple(sample['prompt_ids'])
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(sample)
+
+    filtered = []
+    num_filtered_groups = 0
+    for key, group in groups.items():
+        rewards = [s['pred_rewards'].sum().item() for s in group]
+        # Filter if all rewards are identical (no variance = no learning signal)
+        if len(set(round(r, 6) for r in rewards)) <= 1:
+            num_filtered_groups += 1
+            continue
+        filtered.extend(group)
+
+    if logger and num_filtered_groups > 0:
+        logger.info(f"[GroupFilter] Filtered {num_filtered_groups}/{len(groups)} prompt groups "
+                    f"with uniform rewards ({len(rollout_samples) - len(filtered)} samples removed)")
+
+    return filtered
+
+
+def apply_batch_advantage_norm(replay_buffer, mode, logger=None):
+    '''
+        Apply batch-level post-processing to advantages in the replay buffer.
+        Called after all rollouts are collected and added to the buffer.
+        mode:
+          - "none": no batch normalization
+          - "whiten": (A - mean_batch) / std_batch  [REINFORCE++, REINFORCE++ baseline]
+          - "batch_std": A / std_batch  [LitePPO]
+    '''
+    if mode is None or mode == "none" or len(replay_buffer) == 0:
+        return
+
+    # Collect all advantage values (zscores) across the buffer
+    all_advs = []
+    for item in replay_buffer.items:
+        mask = item["masks"]
+        zscores = item["zscores"]
+        valid = zscores[mask > 0.5]
+        if valid.numel() > 0:
+            all_advs.append(valid)
+
+    if len(all_advs) == 0:
+        return
+
+    all_advs = torch.cat(all_advs)
+    batch_mean = all_advs.mean().item()
+    batch_std = all_advs.std().item() + 1e-8
+
+    # Apply normalization in-place
+    for item in replay_buffer.items:
+        if mode == "whiten":
+            item["zscores"] = (item["zscores"] - batch_mean) / batch_std
+        elif mode == "batch_std":
+            item["zscores"] = item["zscores"] / batch_std
+
+    if logger:
+        logger.info(f"[AdvNorm] Applied batch-level '{mode}' normalization "
+                    f"(mean={batch_mean:.4f}, std={batch_std:.4f})")
+
+
+def apply_gdpo_normalization(replay_buffer, reward_keys, reward_weights, eps=1e-8, logger=None):
+    '''
+        GDPO: normalize each reward dimension independently within prompt groups,
+        then aggregate with weights. This operates on the replay buffer in-place,
+        replacing zscore values.
+
+        Requires samples in the replay buffer to have multi-reward fields
+        stored as 'reward_{key}' tensors. Falls back to single-reward normalization
+        if the fields are not present.
+
+        reward_keys: list of reward component names, e.g. ["accuracy", "format"]
+        reward_weights: list of weights for each component
+    '''
+    if not reward_keys or not reward_weights or len(replay_buffer) == 0:
+        return
+
+    if len(reward_keys) != len(reward_weights):
+        raise ValueError(f"GDPO: reward_keys ({len(reward_keys)}) and reward_weights ({len(reward_weights)}) must have same length")
+
+    # Check if multi-reward fields exist
+    sample_keys = set(replay_buffer.items[0].keys()) if replay_buffer.items else set()
+    reward_fields = [f"reward_{k}" for k in reward_keys]
+    has_multi_reward = all(f in sample_keys for f in reward_fields)
+
+    if not has_multi_reward:
+        if logger:
+            logger.info("[GDPO] Multi-reward fields not found in replay buffer, skipping GDPO normalization")
+        return
+
+    # Group items by prompt (using a hash of input_ids)
+    groups = {}
+    for idx, item in enumerate(replay_buffer.items):
+        # Use first 20 tokens as prompt key (sufficient for grouping)
+        key = tuple(item["input_ids"][:20].tolist())
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(idx)
+
+    # For each reward dimension, normalize within each group
+    for item in replay_buffer.items:
+        item["_gdpo_adv"] = torch.zeros_like(item["zscores"])
+
+    for k_idx, (key, field) in enumerate(zip(reward_keys, reward_fields)):
+        w = reward_weights[k_idx]
+        for group_indices in groups.values():
+            # Compute group mean and std for this reward dimension
+            rewards_k = [replay_buffer.items[i][field].sum().item() for i in group_indices]
+            mean_k = sum(rewards_k) / len(rewards_k)
+            std_k = (sum((r - mean_k)**2 for r in rewards_k) / max(len(rewards_k) - 1, 1)) ** 0.5
+
+            for i, idx in enumerate(group_indices):
+                normalized = (rewards_k[i] - mean_k) / (std_k + eps)
+                # Add weighted normalized advantage to the accumulator
+                item = replay_buffer.items[idx]
+                mask = item["masks"]
+                # Broadcast scalar advantage to valid positions
+                item["_gdpo_adv"][mask > 0.5] += w * normalized
+
+    # Replace zscores with GDPO-aggregated advantages
+    for item in replay_buffer.items:
+        item["zscores"] = item.pop("_gdpo_adv")
+
+    if logger:
+        logger.info(f"[GDPO] Applied multi-reward normalization with keys={reward_keys}, weights={reward_weights}")
+
+
 def collect_rollouts(dataloader,
                      rollout_engines,
                      epoch,
@@ -323,7 +467,8 @@ def collect_rollouts(dataloader,
                      replay_buffer,
                      n_samples,
                      logger,
-                     rollout_timeout):
+                     rollout_timeout,
+                     filter_groups=False):
 
     '''
         This function is used to run rollout engine and generate rollouts/samples.
@@ -371,6 +516,10 @@ def collect_rollouts(dataloader,
         # 4. merge rollouts across all engines and collect stats
         rollout_merged, stats = merge_rollout_with_stats(rollout_lists)
         rollout_stats.accumulate(acc, stats)
+
+        # 4b. DAPO dynamic group filtering: remove groups with uniform rewards
+        if filter_groups:
+            rollout_merged = filter_uniform_groups(rollout_merged, n_samples, logger=logger)
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
@@ -827,6 +976,7 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
     # 2. all engines must finish before we proceed. collect_rollouts is blocking call.
     logger.info(f"[Epoch {epoch+1}] Starting rollout generation...")
     rollout_dataloader.batch_sampler.set_epoch(epoch)
+    filter_groups_flag = getattr(config.rollout, 'filter_groups', False) if config.rollout else False
     rollout_metrics = collect_rollouts(dataloader=rollout_dataloader,
                                        rollout_engines=rollout_engines,
                                        epoch=epoch,
@@ -834,7 +984,36 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                                        replay_buffer=replay_buffer,
                                        n_samples=n_samples,
                                        logger=logger,
-                                       rollout_timeout=rollout_timeout)
+                                       rollout_timeout=rollout_timeout,
+                                       filter_groups=filter_groups_flag)
+
+    # 2b. Dynamic group filtering (DAPO): remove groups with uniform rewards
+    if hasattr(config, 'rollout') and config.rollout and getattr(config.rollout, 'filter_groups', False):
+        before_count = len(replay_buffer)
+        # Re-filter by rebuilding buffer from filtered samples
+        # Note: filter_uniform_groups works on raw rollout samples before they enter the buffer.
+        # Since samples are already in the buffer, we filter by removing items with zero advantage variance.
+        # A simpler approach: evict items belonging to groups with identical rewards.
+        # For now, filtering happens in collect_rollouts before add_batch_seqs.
+        # This is a placeholder for future integration.
+        pass
+
+    # 2c. Batch-level advantage normalization
+    adv_batch_norm = getattr(config.train, 'advantage_batch_norm', None)
+    if adv_batch_norm and adv_batch_norm != "none":
+        apply_batch_advantage_norm(replay_buffer, mode=adv_batch_norm, logger=logger)
+
+    # 2d. PF-PPO: reward-weighted replay resampling
+    if getattr(config.train, 'pf_ppo_enabled', False):
+        weight_pow = getattr(config.train, 'pf_ppo_weight_pow', 2.0)
+        replay_buffer.resample_by_reward(weight_pow=weight_pow)
+        logger.info(f"[Epoch {epoch+1}] PF-PPO resampled replay buffer (weight_pow={weight_pow})")
+
+    # 2e. GDPO: multi-reward normalization
+    reward_keys = getattr(config.reward, 'reward_keys', None) if config.reward else None
+    reward_weights = getattr(config.reward, 'reward_weights', None) if config.reward else None
+    if reward_keys and reward_weights:
+        apply_gdpo_normalization(replay_buffer, reward_keys, reward_weights, logger=logger)
 
     # 3. Prepare training batches
     logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")

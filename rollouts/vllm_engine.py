@@ -38,6 +38,7 @@ class VLLMRolloutEngine:
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
+                 advantage_mode: str = "zscore",
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -92,6 +93,8 @@ class VLLMRolloutEngine:
         self.eps_reward_norm = float(eps_reward_norm)
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
+        # Advantage estimation mode
+        self.advantage_mode = str(advantage_mode) if advantage_mode else "zscore"
 
     def log(self, msg: str) -> None:
         '''
@@ -645,40 +648,72 @@ class VLLMRolloutEngine:
                           is_per_token: bool) -> None:
         '''
             Normalize rewards for each group of samples for a given prompt.
-            samples: list of different responses for a given prompt e.g., [{"prompt_ids": [...], "response_ids": [...],...}, ...]
-            stats: {"reward": [...], "length": [...]} or {"reward": [...], "length": [...], "reward": [...], "length": [...]} if reward_broadcast is True
-         '''
-        denom = len(samples) # number of samples in the group
-        if len(samples) > 1:
-            rewards_array = np.array(stats['rewards'])
-            mean_scores = rewards_array.sum() / denom
-            # Bessel's correction (n-1) for unbiased sample std with small n_samples
-            std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / max(denom - 1, 1))
-
-        else:
-            # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
-            # but usually for n=1 we keep the raw reward.
-            mean_scores = 0.0
-            std_scores  = 1.0
-
+            Supports multiple advantage modes:
+              - zscore: (r - mean) / (std + eps)  [GRPO]
+              - mean_only: r - mean  [Dr.GRPO, REINFORCE++ baseline, LitePPO]
+              - rloo: r - mean_others = G/(G-1)*(r - mean_all)  [RLOO]
+              - token_returns: raw rewards kept, returns computed later
+              - greedy_baseline: raw rewards kept, baseline computed later
+        '''
+        denom = len(samples)
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
 
-        # now update the rewards in the samples
+        if self.advantage_mode == "token_returns" or self.advantage_mode == "greedy_baseline":
+            # For token_returns and greedy_baseline, keep raw rewards;
+            # advantage computation happens in training loop
+            for sample in samples:
+                zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
+                zscore[-1] = sample['token_rewards'][-1]
+                sample["token_zscores"] = zscore
+                if self.reward_broadcast:
+                    sample["token_zscores"][prompt_len:] = zscore[-1]
+                # prediction-aligned zscores
+                pred_zscores = torch.zeros_like(sample['token_zscores'], dtype=torch.float)
+                pred_start = prompt_len - 1
+                pred_end = len(sample['token_zscores']) - 1
+                pred_zscores[pred_start:pred_end] = sample["token_zscores"][prompt_len:]
+                sample["pred_zscores"] = pred_zscores
+            return
+
+        if denom > 1:
+            rewards_array = np.array(stats['rewards'])
+            mean_scores = rewards_array.sum() / denom
+            # Bessel's correction (n-1) for unbiased sample std with small n_samples
+            std_scores = np.sqrt(((rewards_array - mean_scores)**2).sum() / max(denom - 1, 1))
+        else:
+            mean_scores = 0.0
+            std_scores = 1.0
+
         for i, sample in enumerate(samples):
-            # sample['reward']: [T] where prompt tokens would get 0
-            # sample['reward'][-1]: means the last token reward
             zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
-            zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
+            raw_reward = sample['token_rewards'][-1].item()
+
+            if self.advantage_mode == "zscore":
+                # GRPO: z-score normalization
+                zscore[-1] = (raw_reward - mean_scores) / (std_scores + self.eps_reward_norm)
+            elif self.advantage_mode == "mean_only":
+                # Dr.GRPO / REINFORCE++ baseline: subtract mean, no std division
+                zscore[-1] = raw_reward - mean_scores
+            elif self.advantage_mode == "rloo":
+                # RLOO: leave-one-out baseline
+                # A_i = r_i - mean_others = G/(G-1) * (r_i - mean_all)
+                if denom > 1:
+                    zscore[-1] = (raw_reward * denom / (denom - 1)
+                                  - mean_scores * denom / (denom - 1))
+                else:
+                    zscore[-1] = raw_reward
+            else:
+                raise ValueError(f"Unknown advantage_mode: {self.advantage_mode}")
+
             sample["token_zscores"] = zscore
             if self.reward_broadcast:
                 sample["token_zscores"][prompt_len:] = zscore[-1]
 
             # prediction-aligned zscores
-            # zscore[prompt_len:] corresponds to response tokens 0..N-1
             pred_zscores = torch.zeros_like(sample['token_zscores'], dtype=torch.float)
             pred_start = prompt_len - 1
-            pred_end   = len(sample['token_zscores']) - 1
+            pred_end = len(sample['token_zscores']) - 1
             pred_zscores[pred_start:pred_end] = sample["token_zscores"][prompt_len:]
             sample["pred_zscores"] = pred_zscores
 

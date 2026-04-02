@@ -15,6 +15,27 @@ import time
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
 
+class AdaptiveKLController:
+    '''
+        Proportional controller that dynamically adjusts the KL penalty coefficient
+        to track a target KL divergence. From Ziegler et al. (2019).
+    '''
+    def __init__(self, init_kl_coef: float, target_kl: float, horizon: int = 10000):
+        self.value = init_kl_coef
+        self.target = target_kl
+        self.horizon = horizon
+
+    def update(self, current_kl: float, n_steps: int = 1):
+        '''
+            Adjust kl_coef based on observed KL divergence.
+            If current_kl > target, increase coefficient.
+            If current_kl < target, decrease coefficient.
+        '''
+        proportional_error = np.clip(current_kl / self.target - 1, -0.2, 0.2)
+        mult = 1.0 + proportional_error * n_steps / self.horizon
+        self.value = max(self.value * mult, 1e-8)
+        return self.value
+
 class COMMON:
     '''
         This class provides common functions for policy gradient algorithms.
@@ -96,26 +117,84 @@ class COMMON:
 
         return ref_logprobs
 
-    def compute_kl_distance(self, logprobs, ref_logprobs):
+    def teacher_forward(self, input_ids, att_mask, pos_ids):
+        '''
+            Forward pass through the teacher model for on-policy distillation.
+            Returns teacher_logprobs [B, T-1] under no_grad.
+        '''
+        if not hasattr(self, 'teacher_engine') or self.teacher_engine is None:
+            return None
+
+        with torch.no_grad():
+            if pos_ids is not None:
+                pos_ids = pos_ids.to(input_ids.device)
+
+            output = self.teacher_engine(input_ids=input_ids,
+                                          attention_mask=att_mask,
+                                          position_ids=pos_ids,
+                                          use_cache=False)
+
+            logits = output.logits[:, :-1, :].contiguous()
+            B, T_minus_1, vocab_size = logits.shape
+            target_ids = input_ids[:, 1:].contiguous()
+
+            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
+            teacher_logprobs = -neg_logprobs.view(B, T_minus_1)
+
+        return teacher_logprobs
+
+    def compute_distillation_loss(self, logprobs, teacher_logprobs, mask):
+        '''
+            Compute reverse KL distillation loss: D_KL(pi_student || pi_teacher).
+            Per-token RKL: (log_pi_student - log_pi_teacher) weighted by mask.
+            Returns: distill_loss_sum (scalar), num_tokens (float)
+        '''
+        if teacher_logprobs is None:
+            return torch.tensor(0.0, device=logprobs.device), 0.0
+
+        mask_float = (mask > 0.5).to(dtype=logprobs.dtype)
+        # Reverse KL per token: student log-prob - teacher log-prob
+        rkl = (logprobs - teacher_logprobs) * mask_float
+        distill_loss_sum = rkl.sum()
+        num_tokens = float(mask_float.sum().item())
+        return distill_loss_sum, num_tokens
+
+    def compute_kl_distance(self, logprobs, ref_logprobs, kl_mode=None):
         '''
             Compute KL divergence between two policies.
-            using var_reduced form:
-            kl = E[log pi/pi_ref] + pi_ref/pi - 1
+            Supports multiple modes:
+              k1: log(pi/pi_ref) — biased gradient, unbiased estimate
+              k2: 0.5 * (log(pi) - log(pi_ref))^2 — unbiased gradient (MSE)
+              k3: exp(log(pi_ref/pi)) - log(pi_ref/pi) - 1 — low variance (default)
+              abs: |log(pi) - log(pi_ref)| — absolute KL
+              k3_plus: straight-through: k3 value in forward, k2 gradient in backward
         '''
-        # [B, T-1]
-        # Perform KL math in float32 for numerical stability under bf16/fp16.
+        if kl_mode is None:
+            kl_mode = getattr(self, '_kl_mode', 'k3')
+
         logprobs = logprobs.to(torch.float32)
         ref_logprobs = ref_logprobs.to(torch.float32)
-
         log_ratio = logprobs - ref_logprobs
-        # pi_ref/pi = exp(ref_logprobs - logprobs)
-        exponent = ref_logprobs - logprobs
-        #if exponent.max().item() > 10.0:
-        #    print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
 
-        ratio_inv = torch.exp(exponent)
-        kl_dist = log_ratio + ratio_inv - 1
-        return kl_dist
+        if kl_mode == 'k1':
+            return log_ratio
+        elif kl_mode == 'k2':
+            return 0.5 * log_ratio.pow(2)
+        elif kl_mode == 'k3':
+            exponent = ref_logprobs - logprobs
+            ratio_inv = torch.exp(exponent)
+            return log_ratio + ratio_inv - 1
+        elif kl_mode == 'abs':
+            return log_ratio.abs()
+        elif kl_mode == 'k3_plus':
+            # Straight-through: use k3 for forward value, k2 for backward gradient
+            exponent = ref_logprobs - logprobs
+            ratio_inv = torch.exp(exponent)
+            forward_score = log_ratio + ratio_inv - 1
+            backward_score = 0.5 * log_ratio.pow(2)
+            return backward_score - backward_score.detach() + forward_score.detach()
+        else:
+            raise ValueError(f"Unknown kl_mode: {kl_mode}. Must be one of: k1, k2, k3, abs, k3_plus")
 
     def sanitize_logprobs(self, logprobs, engine_id, step, num_micro):
         '''
@@ -316,6 +395,22 @@ class COMMON:
                                                     config=ref_ds_config
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Reference model initialized with DeepSpeed")
+
+        # Initialize teacher model for on-policy distillation (if provided)
+        self.teacher_engine = None
+        teacher_model_path = getattr(self, 'teacher_model_path', None)
+        distill_weight = getattr(self, 'distill_weight', 0.0)
+        if teacher_model_path and distill_weight > 0.0:
+            teacher_model = self.load_single_model(model_path=teacher_model_path, dtype=self.model_dtype, model_name="teacher")
+            teacher_model.eval()
+            teacher_model.requires_grad_(False)
+            # Use same DS config as ref model (inference-only)
+            teacher_ds_config = self.deepspeed_ref_config.model_dump() if self.deepspeed_ref_config else ds_config_dict
+            self.teacher_engine, _, _, _ = deepspeed.initialize(
+                                                    model=teacher_model,
+                                                    config=teacher_ds_config
+                                                    )
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Teacher model initialized for distillation (weight={distill_weight})")
 
         # Initialize value model
         if value_model is not None:
